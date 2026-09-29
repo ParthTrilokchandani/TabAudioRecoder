@@ -1,0 +1,12 @@
+{
+  "name": "tab-audio-server",
+  "version": "1.0.0",
+  "description": "Receives live tab audio from the Chrome extension and plays it in a browser GUI.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}

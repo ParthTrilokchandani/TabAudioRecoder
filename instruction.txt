@@ -1,0 +1,7 @@
+1. i want to make a chrome browser extension which send audio of system like what he is watching in you tube or in
+  friends meetings whether using teams or google meet or zoom if its attaneding using browser in which this
+  extension is there then audio must be saved in file -- as final semester project.
+
+2.  can i send this audio using VPN to other device which also has an VPN so basically for the very first it should
+  ask fro ip address of server in extension also made me gui server which receives this and how to host that in sepearte folder.
+but audio must be live transmission not recorded this time.

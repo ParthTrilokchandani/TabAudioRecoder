@@ -1,0 +1,226 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Tab Audio — Live Listener</title>
+    <style>
+      :root { color-scheme: dark; }
+      body {
+        font-family: system-ui, sans-serif; margin: 0; min-height: 100vh;
+        background: #0f1115; color: #e8eaed;
+        display: flex; align-items: center; justify-content: center;
+      }
+      .card {
+        background: #1a1d24; border: 1px solid #2a2e37; border-radius: 16px;
+        padding: 32px; width: 340px; text-align: center;
+        box-shadow: 0 20px 60px rgba(0,0,0,.4);
+      }
+      h1 { font-size: 18px; margin: 0 0 4px; }
+      p.sub { color: #9aa0a6; font-size: 13px; margin: 0 0 24px; }
+      button {
+        width: 100%; padding: 14px; font-size: 15px; font-weight: 600;
+        border: none; border-radius: 10px; cursor: pointer; color: #fff;
+        background: #1a73e8; transition: background .15s;
+      }
+      button:hover { background: #1666d0; }
+      button.stop { background: #d93025; }
+      .status {
+        margin-top: 20px; font-size: 13px; color: #9aa0a6;
+        display: flex; align-items: center; justify-content: center; gap: 8px;
+      }
+      .dot { width: 9px; height: 9px; border-radius: 50%; background: #5f6368; }
+      .dot.live { background: #34a853; animation: pulse 1.2s infinite; }
+      .dot.warn { background: #f9ab00; animation: pulse 1.2s infinite; }
+      .dot.err { background: #d93025; }
+      @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: .3; } }
+      .meta { margin-top: 8px; font-size: 11px; color: #6b6f73; }
+      audio { display: none; }
+      .viz { margin-top: 20px; }
+      canvas { width: 100%; height: 90px; background: #0b0d11; border-radius: 10px; display: block; }
+      .meter { height: 8px; background: #0b0d11; border-radius: 4px; margin-top: 8px; overflow: hidden; }
+      .meter > div {
+        height: 100%; width: 0%;
+        background: linear-gradient(90deg, #34a853, #fbbc04, #d93025);
+        transition: width .05s linear;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="card">
+      <h1>🎧 Live Tab Audio</h1>
+      <p class="sub">Playing audio streamed from the Chrome extension.</p>
+      <button id="btn">Start listening</button>
+      <div class="status"><span id="dot" class="dot"></span><span id="state">Idle</span></div>
+      <div class="meta" id="meta">0 KB received</div>
+      <div class="viz">
+        <canvas id="scope" width="600" height="180"></canvas>
+        <div class="meter"><div id="level"></div></div>
+      </div>
+      <audio id="player" controls autoplay></audio>
+    </div>
+
+    <script>
+      const btn = document.getElementById("btn");
+      const dot = document.getElementById("dot");
+      const stateEl = document.getElementById("state");
+      const meta = document.getElementById("meta");
+      const player = document.getElementById("player");
+
+      const scope = document.getElementById("scope");
+      const level = document.getElementById("level");
+      const sctx = scope.getContext("2d");
+
+      let ws = null, mediaSource = null, sourceBuffer = null;
+      let audioCtx = null, analyser = null, srcNode = null, rafId = null;
+      const queue = [];
+      let received = 0, playing = false;
+
+      const MIME = 'audio/webm; codecs="opus"';
+
+      function setupViz() {
+        // Route the <audio> element through Web Audio for analysis + playback.
+        if (!audioCtx) {
+          audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+          srcNode = audioCtx.createMediaElementSource(player);
+          analyser = audioCtx.createAnalyser();
+          analyser.fftSize = 1024;
+          srcNode.connect(analyser);
+          analyser.connect(audioCtx.destination); // keep it audible
+        }
+        audioCtx.resume();
+        drawViz();
+      }
+
+      function drawViz() {
+        rafId = requestAnimationFrame(drawViz);
+        const buf = new Uint8Array(analyser.fftSize);
+        analyser.getByteTimeDomainData(buf);
+
+        // waveform
+        sctx.clearRect(0, 0, scope.width, scope.height);
+        sctx.lineWidth = 2;
+        sctx.strokeStyle = "#34a853";
+        sctx.beginPath();
+        const step = scope.width / buf.length;
+        let peak = 0;
+        for (let i = 0; i < buf.length; i++) {
+          const v = (buf[i] - 128) / 128;       // -1..1
+          if (Math.abs(v) > peak) peak = Math.abs(v);
+          const y = scope.height / 2 + v * (scope.height / 2 - 4);
+          i === 0 ? sctx.moveTo(0, y) : sctx.lineTo(i * step, y);
+        }
+        sctx.stroke();
+
+        // level meter
+        level.style.width = Math.min(100, peak * 140).toFixed(0) + "%";
+      }
+
+      function stopViz() {
+        if (rafId) cancelAnimationFrame(rafId);
+        rafId = null;
+        sctx.clearRect(0, 0, scope.width, scope.height);
+        level.style.width = "0%";
+      }
+
+      function setState(text, cls) {
+        stateEl.textContent = text;
+        dot.className = "dot" + (cls ? " " + cls : "");
+      }
+
+      function pump() {
+        if (!sourceBuffer || sourceBuffer.updating || queue.length === 0) return;
+        try {
+          sourceBuffer.appendBuffer(queue.shift());
+        } catch (e) {
+          console.error("appendBuffer failed", e);
+        }
+      }
+
+      function trimBuffer() {
+        // Keep the live buffer small so playback stays near real time.
+        if (!sourceBuffer || sourceBuffer.updating) return;
+        const buffered = sourceBuffer.buffered;
+        if (buffered.length && player.currentTime - buffered.start(0) > 6) {
+          try { sourceBuffer.remove(buffered.start(0), player.currentTime - 2); } catch (e) {}
+        }
+      }
+
+      let active = false;      // user wants to be listening
+      let reconnectTimer = null;
+
+      function start() {
+        if (!("MediaSource" in window) || !MediaSource.isTypeSupported(MIME)) {
+          setState("Browser can't play this stream", "err");
+          return;
+        }
+        active = true;
+        btn.textContent = "Stop listening";
+        btn.className = "stop";
+        openStream();
+      }
+
+      // (Re)build a fresh MediaSource + socket. Called on start and on reconnect.
+      function openStream() {
+        if (!active) return;
+        clearTimeout(reconnectTimer);
+        queue.length = 0;
+        sourceBuffer = null;
+        playing = false;
+
+        mediaSource = new MediaSource();
+        player.src = URL.createObjectURL(mediaSource);
+        mediaSource.addEventListener("sourceopen", () => {
+          try {
+            sourceBuffer = mediaSource.addSourceBuffer(MIME);
+            sourceBuffer.mode = "sequence";
+            sourceBuffer.addEventListener("updateend", () => { pump(); trimBuffer(); });
+          } catch (e) { console.error(e); }
+          connect();
+        }, { once: true });
+      }
+
+      function connect() {
+        const proto = location.protocol === "https:" ? "wss" : "ws";
+        ws = new WebSocket(`${proto}://${location.host}/listener`);
+        ws.binaryType = "arraybuffer";
+
+        setState("Connecting…", "");
+        ws.onopen = () => setState("Waiting for audio…", "live");
+        ws.onmessage = (ev) => {
+          received += ev.data.byteLength;
+          meta.textContent = (received / 1024).toFixed(0) + " KB received";
+          setState("Live", "live");
+          if (!sourceBuffer) return;
+          queue.push(new Uint8Array(ev.data));
+          pump();
+          if (!playing) { player.play().catch(() => {}); setupViz(); playing = true; }
+        };
+        ws.onerror = () => { /* onclose drives reconnect */ };
+        ws.onclose = () => {
+          if (!active) return;               // user stopped -> stay idle
+          setState("Server disconnected — reconnecting…", "warn");
+          clearTimeout(reconnectTimer);
+          reconnectTimer = setTimeout(openStream, 1500);
+        };
+      }
+
+      function stop() {
+        active = false;
+        clearTimeout(reconnectTimer);
+        if (ws) { ws.onclose = null; ws.close(); }
+        try { if (mediaSource && mediaSource.readyState === "open") mediaSource.endOfStream(); } catch (e) {}
+        player.pause();
+        playing = false;
+        stopViz();
+        btn.textContent = "Start listening";
+        btn.className = "";
+        setState("Idle", "");
+      }
+
+      btn.addEventListener("click", () => {
+        if (active) stop(); else start();
+      });
+    </script>
+  </body>
+</html>
