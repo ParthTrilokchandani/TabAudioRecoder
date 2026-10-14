@@ -35,41 +35,97 @@ const server = http.createServer((req, res) => {
 });
 
 // --- websocket fan-out -----------------------------------------------------
+// WebM/MSE requirement: a player must receive the *initialization segment*
+// (EBML header … Tracks) first, and then media data starting at a *cluster*
+// boundary. A listener that joins mid-stream and gets bytes from the middle of
+// a cluster receives data (KB go up) but cannot decode it (no audio). So the
+// server parses the WebM byte stream: it caches the init segment (everything
+// before the first Cluster) and only starts a new listener at the next cluster
+// boundary, sending it the cached header first.
 const wss = new WebSocketServer({ server });
-const listeners = new Set();
-let headerChunk = null; // first chunk of the current producer session
+const listeners = new Map(); // ws -> { synced: boolean }
+
+// EBML element id for a Cluster: 0x1F43B675
+const CLUSTER_ID = Buffer.from([0x1f, 0x43, 0xb6, 0x75]);
+
+let session = null; // current producer session
+
+class ProducerSession {
+  constructor(fileStream) {
+    this.fileStream = fileStream;
+    this.headerParts = [];
+    this.header = null;      // Buffer once complete
+    this.headerDone = false;
+    this.carry = Buffer.alloc(0); // last few bytes, to catch an id split across chunks
+  }
+
+  onData(chunk) {
+    if (!Buffer.isBuffer(chunk)) chunk = Buffer.from(chunk);
+    this.fileStream.write(chunk); // saved file gets the full continuous stream
+
+    // Find the first cluster boundary that begins within THIS chunk.
+    const combined = Buffer.concat([this.carry, chunk]);
+    let firstBoundary = -1;
+    let idx = combined.indexOf(CLUSTER_ID, 0);
+    while (idx !== -1) {
+      const offsetInChunk = idx - this.carry.length;
+      if (offsetInChunk >= 0) { firstBoundary = offsetInChunk; break; }
+      idx = combined.indexOf(CLUSTER_ID, idx + 1);
+    }
+    this.carry = combined.subarray(Math.max(0, combined.length - 3));
+
+    // Accumulate the init segment until the first cluster appears.
+    if (!this.headerDone) {
+      if (firstBoundary === -1) {
+        this.headerParts.push(chunk);
+        return; // nothing decodable to send yet
+      }
+      this.headerParts.push(chunk.subarray(0, firstBoundary));
+      this.header = Buffer.concat(this.headerParts);
+      this.headerDone = true;
+    }
+
+    // Fan out.
+    for (const [ws, st] of listeners) {
+      if (ws.readyState !== ws.OPEN) continue;
+      if (st.synced) {
+        ws.send(chunk); // continuous stream for already-synced players
+      } else if (firstBoundary !== -1) {
+        ws.send(this.header);                 // init segment first
+        ws.send(chunk.subarray(firstBoundary)); // then from a clean cluster
+        st.synced = true;
+      }
+      // else: not synced yet and no boundary in this chunk -> wait for one
+    }
+  }
+}
 
 wss.on("connection", (ws, req) => {
   const url = req.url || "";
 
   if (url.startsWith("/producer")) {
-    console.log("Producer connected (extension is streaming).");
-    headerChunk = null; // new session
-
-    // Also save this live session to a file while broadcasting it.
+    console.log("Producer connected (streaming).");
     const stamp = new Date().toISOString().replace(/[:.]/g, "-");
     const filePath = path.join(REC_DIR, `stream-${stamp}.webm`);
     const fileStream = fs.createWriteStream(filePath);
     console.log("Saving stream to", filePath);
 
-    ws.on("message", (data) => {
-      if (headerChunk === null) headerChunk = data; // cache init segment
-      fileStream.write(data);                       // save to disk
-      for (const l of listeners) {
-        if (l.readyState === l.OPEN) l.send(data);  // fan out to GUIs
-      }
-    });
+    session = new ProducerSession(fileStream);
+    // New session => existing listeners must re-sync to the new header.
+    for (const st of listeners.values()) st.synced = false;
+
+    ws.on("message", (data) => { if (session) session.onData(data); });
     ws.on("close", () => {
       console.log("Producer disconnected. Saved:", filePath);
       fileStream.end();
-      headerChunk = null;
+      session = null;
     });
 
   } else {
     // listener (browser GUI)
-    console.log("Listener connected. Total listeners:", listeners.size + 1);
-    listeners.add(ws);
-    if (headerChunk) ws.send(headerChunk); // catch it up with the header
+    listeners.set(ws, { synced: false });
+    console.log("Listener connected. Total listeners:", listeners.size);
+    // It will be synced by the producer at the next cluster boundary.
     ws.on("close", () => {
       listeners.delete(ws);
       console.log("Listener left. Total listeners:", listeners.size);
